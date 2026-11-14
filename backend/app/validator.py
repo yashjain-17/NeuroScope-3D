@@ -1,18 +1,21 @@
 """
-Input Sanity & Validation Middleware for NeuroScope 3D.
-Enforces all Judges' Failure Pack criteria and medical scan integrity.
+Input validation for NeuroScope 3D.
+Checks NIfTI integrity, dimensions, finite values, file size and modality alignment.
 """
 
 import hashlib
 import os
 from typing import Dict, Tuple
+
 import nibabel as nib
 import numpy as np
+
 from .config import MAX_FILE_SIZE_BYTES, REQUIRED_MODALITIES
 
 
 class ValidationError(Exception):
-    """Custom exception raised when an input scan fails validation."""
+    """Raised when an input scan fails validation."""
+
     def __init__(self, code: str, message: str, details: dict = None):
         self.code = code
         self.message = message
@@ -21,113 +24,123 @@ class ValidationError(Exception):
 
 
 def compute_sha256(file_path: str) -> str:
-    """Computes SHA-256 hash of a file for audit provenance."""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(65536), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+    """Compute SHA-256 in bounded memory for audit provenance."""
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def check_file_size(file_path: str):
-    """Rejects inputs exceeding the 1 GB size limit."""
+def check_file_size(file_path: str) -> None:
+    """Reject files larger than the configured upload limit."""
     file_size = os.path.getsize(file_path)
     if file_size > MAX_FILE_SIZE_BYTES:
         raise ValidationError(
             code="FILE_TOO_LARGE",
-            message=f"File exceeds maximum allowed size of 1 GB ({file_size / (1024**3):.2f} GB)."
+            message=(
+                f"File exceeds the maximum allowed size of "
+                f"{MAX_FILE_SIZE_BYTES / (1024 ** 3):.2f} GB "
+                f"({file_size / (1024 ** 3):.2f} GB received)."
+            ),
         )
 
 
-def validate_single_nifti(file_path: str) -> Tuple[nib.Nifti1Image, np.ndarray, np.ndarray, Tuple[float, ...]]:
-    """Validates a single NIfTI scan."""
+def validate_single_nifti(
+    file_path: str,
+) -> Tuple[nib.Nifti1Image, np.ndarray, np.ndarray, Tuple[float, ...]]:
+    """Load and validate one 3D NIfTI scan."""
     check_file_size(file_path)
 
     try:
-        img = nib.load(file_path)
-        data = img.get_fdata(dtype=np.float32)
+        image = nib.load(file_path)
+        data = image.get_fdata(dtype=np.float32)
     except Exception as exc:
         raise ValidationError(
             code="CORRUPT_NIFTI",
-            message=f"Failed to parse NIfTI file. Ensure valid, uncorrupted `.nii` or `.nii.gz` format. Error: {str(exc)}"
-        )
+            message=f"Failed to parse NIfTI file: {exc}",
+        ) from exc
 
     if data.ndim != 3:
         raise ValidationError(
             code="UNSUPPORTED_DIMENSIONS",
-            message=f"Expected 3D spatial volume, but received {data.ndim}D array."
+            message=f"Expected a 3D volume, received {data.ndim}D data.",
         )
-
-    if not np.all(np.isfinite(data)):
+    if not np.isfinite(data).all():
         raise ValidationError(
             code="NONFINITE_VALUES",
-            message="Volume contains non-finite numbers (NaN or Inf values)."
+            message="Volume contains non-finite values (NaN or Inf).",
         )
-
-    if np.all(data == 0) or np.std(data) == 0:
+    if not np.any(data) or float(np.std(data)) == 0.0:
         raise ValidationError(
             code="CONSTANT_VOLUME",
-            message="Volume is constant or contains all zero voxels."
+            message="Volume is constant or contains only zero voxels.",
         )
 
-    affine = img.affine
-    header = img.header
-    zooms = header.get_zooms()[:3]
-
-    return img, data, affine, zooms
+    return image, data, image.affine, image.header.get_zooms()[:3]
 
 
 def check_skull_stripped(data: np.ndarray) -> bool:
-    """Heuristic check for skull-stripped brain scans."""
-    border_voxels = np.concatenate([
-        data[0, :, :].ravel(), data[-1, :, :].ravel(),
-        data[:, 0, :].ravel(), data[:, -0, :].ravel(),
-        data[:, :, 0].ravel(), data[:, :, -1].ravel(),
-    ])
-    non_zero_border_ratio = np.count_nonzero(border_voxels) / float(len(border_voxels))
-    return non_zero_border_ratio < 0.05
+    """Estimate skull stripping from non-zero values on all six volume faces."""
+    border_voxels = np.concatenate(
+        [
+            data[0, :, :].ravel(),
+            data[-1, :, :].ravel(),
+            data[:, 0, :].ravel(),
+            data[:, -1, :].ravel(),
+            data[:, :, 0].ravel(),
+            data[:, :, -1].ravel(),
+        ]
+    )
+    if border_voxels.size == 0:
+        return False
+    non_zero_ratio = np.count_nonzero(border_voxels) / float(border_voxels.size)
+    return non_zero_ratio < 0.05
 
 
-def validate_study_set(file_paths: Dict[str, str]) -> Dict[str, any]:
-    """Validates the full 4-sequence study set (T1, T1Gd, T2, FLAIR)."""
-    for mod in REQUIRED_MODALITIES:
-        if mod not in file_paths or not file_paths[mod]:
-            raise ValidationError(
-                code="MISSING_SEQUENCE",
-                message=f"Missing required modality sequence: '{mod.upper()}'."
-            )
+def validate_study_set(file_paths: Dict[str, str]) -> Dict[str, object]:
+    """Validate all required modalities and their spatial alignment."""
+    missing = [mod for mod in REQUIRED_MODALITIES if not file_paths.get(mod)]
+    if missing:
+        raise ValidationError(
+            code="MISSING_SEQUENCE",
+            message=f"Missing required modality sequence(s): {', '.join(missing).upper()}.",
+        )
 
-    images, datas, affines, shapes, hashes = {}, {}, {}, {}, []
+    images = {}
+    data_by_modality = {}
+    hashes = []
 
-    for mod in REQUIRED_MODALITIES:
-        path = file_paths[mod]
-        img, data, affine, zooms = validate_single_nifti(path)
-        images[mod], datas[mod], affines[mod], shapes[mod] = img, data, affine, data.shape
-        hashes.append(compute_sha256(path))
+    for modality in REQUIRED_MODALITIES:
+        image, data, affine, _zooms = validate_single_nifti(file_paths[modality])
+        images[modality] = (image, affine)
+        data_by_modality[modality] = data
+        hashes.append(compute_sha256(file_paths[modality]))
 
-    ref_shape = shapes["t1"]
-    ref_affine = affines["t1"]
+    reference_image, reference_affine = images["t1"]
+    reference_shape = data_by_modality["t1"].shape
 
-    for mod in REQUIRED_MODALITIES[1:]:
-        if shapes[mod] != ref_shape:
+    for modality in REQUIRED_MODALITIES:
+        if data_by_modality[modality].shape != reference_shape:
             raise ValidationError(
                 code="SHAPE_MISMATCH",
-                message=f"Shape mismatch: '{mod.upper()}' shape {shapes[mod]} does not match T1 shape {ref_shape}."
+                message=(
+                    f"{modality.upper()} shape {data_by_modality[modality].shape} "
+                    f"does not match T1 shape {reference_shape}."
+                ),
             )
-        if not np.allclose(affines[mod], ref_affine, atol=1e-3):
+        if not np.allclose(images[modality][1], reference_affine, atol=1e-3):
             raise ValidationError(
                 code="AFFINE_MISMATCH",
-                message=f"Affine coordinate mismatch between '{mod.upper()}' and T1 sequence."
+                message=f"Affine coordinate mismatch between {modality.upper()} and T1.",
             )
 
-    is_skull_stripped = check_skull_stripped(datas["t1"])
-    combined_hash = hashlib.sha256("".join(hashes).encode()).hexdigest()
-
+    combined_hash = hashlib.sha256("".join(hashes).encode("utf-8")).hexdigest()
     return {
         "valid": True,
-        "ref_shape": ref_shape,
-        "ref_affine": ref_affine,
-        "zooms": nib.load(file_paths["t1"]).header.get_zooms()[:3],
-        "is_skull_stripped": is_skull_stripped,
+        "ref_shape": reference_shape,
+        "ref_affine": reference_affine,
+        "zooms": reference_image.header.get_zooms()[:3],
+        "is_skull_stripped": check_skull_stripped(data_by_modality["t1"]),
         "combined_hash": combined_hash,
     }
