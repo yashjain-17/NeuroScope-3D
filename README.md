@@ -1,54 +1,91 @@
 # NeuroScope 3D
 
-**See a brain tumour in 3D, measure it, and understand the limits of the model.**
+**Research and teaching prototype for 3D brain MRI segmentation exploration.**
 
-NeuroScope 3D is a research and teaching prototype for exploring brain MRI segmentation results in 3D. It is intended to support learning, visualization, and reproducible experimentation—not diagnosis or clinical decision-making.
+NeuroScope 3D contains a FastAPI backend for validating four-modality NIfTI study sets, running a MONAI-based segmentation pipeline, calculating region volumes, and generating reports. It is not a diagnostic product or a medical device.
 
-> **Medical disclaimer:** This project is not a medical device. Model outputs may be incorrect and must not be used to make patient-care decisions.
+> **Important:** For research and teaching only. Never use the output for diagnosis, treatment, triage, or patient-care decisions.
 
-## Project goals
+## Repository layout
 
-- Visualize suspected tumour regions from multi-modal brain MRI.
-- Explore whole-tumour (WT), tumour-core (TC), and enhancing-tumour (ET) regions.
-- Calculate region volumes in millilitres when valid voxel-spacing metadata is available.
-- Communicate uncertainty and limitations rather than presenting predictions as ground truth.
-- Support research-lab and radiology-teaching workflows using authorized, de-identified data.
+- `backend/main.py` — FastAPI application and API routes
+- `backend/app/` — configuration, validation, inference, volumetrics, database, and PDF generation
+- `backend/requirements.txt` — Python dependencies
+- `docs/` — product, architecture, rules, and task documentation
+- `MODEL_CARD.md` — model documentation
 
-## MRI modalities
+## Requirements
 
-The intended four-modality input set is:
+- Python 3.10 or newer (use a version supported by the installed PyTorch/MONAI wheels)
+- pip and a virtual environment
+- Sufficient RAM and disk space for 3D MRI volumes
+- A compatible CUDA setup is optional; the code falls back to CPU
 
-- **T1** — native T1-weighted MRI
-- **T1Gd** — post-contrast T1-weighted MRI
-- **T2** — T2-weighted MRI
-- **FLAIR** — fluid-attenuated inversion recovery
+## Backend setup
 
-Region definitions:
+Run these commands from the repository root:
 
-- **WT:** NCR + ED + ET
-- **TC:** NCR + ET
-- **ET:** enhancing tumour
+```bash
+cd backend
+python -m venv .venv
+```
 
-## Data safety
+Activate the environment:
 
-- Use only data you are authorized to process.
-- Use de-identified research data; do not upload identifiable patient information.
-- Treat segmentations, measurements, and generated reports as experimental outputs.
-- Have qualified experts review research interpretations.
-- Do not claim clinical accuracy without independent validation on an appropriate dataset.
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+```
 
-## Validation checklist
+```bash
+# macOS / Linux
+source .venv/bin/activate
+```
 
-Before relying on results for research conclusions, verify the model checkpoint and provenance, preprocessing, modality alignment, voxel spacing, evaluation protocol, and reproducibility of the complete pipeline. A 3D visualization alone does not establish segmentation accuracy.
+Install dependencies and start the API:
 
-## Future work
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
 
-- Documented model checkpoints and reproducible inference.
-- Independent evaluation against expert-labelled datasets.
-- Better uncertainty calibration and failure-case visualization.
-- Secure study management, audit trails, and controlled data retention.
-- Accessible 3D review tools for research and teaching.
+API documentation is available at `http://127.0.0.1:8000/docs` while the server is running.
 
-## Disclaimer
+## Input data
 
-NeuroScope 3D is provided for educational and research use only. It does not provide a diagnosis or treatment recommendation and is not a substitute for professional medical judgment.
+The validation route expects four NIfTI volumes:
+
+- T1
+- T1Gd (post-contrast T1)
+- T2
+- FLAIR
+
+An expert mask may optionally be supplied for evaluation workflows. Use only authorized, de-identified research data. Confirm image orientation, alignment, dimensions, affine transforms, and voxel spacing before interpreting any result.
+
+## Region terminology
+
+- **WT (whole tumour):** NCR + ED + ET
+- **TC (tumour core):** NCR + ET
+- **ET (enhancing tumour):** enhancing tumour label
+
+Volume calculations are meaningful only when the image geometry and voxel spacing are valid.
+
+## Known limitations — read before use
+
+- The current inference module constructs a SegResNet architecture but does not load a documented pretrained checkpoint. Until a validated checkpoint and reproducible preprocessing pipeline are integrated, predictions must be treated as experimental/unvalidated.
+- The repository tree currently contains a backend but no checked-in frontend application.
+- A successful API response or 3D rendering is not evidence of clinical accuracy.
+- Security, access control, retention, deployment hardening, and independent model validation must be completed before any wider deployment.
+
+## Research validation checklist
+
+Record dataset provenance and permissions, model/checkpoint hash, preprocessing settings, modality registration, voxel spacing, expert-label protocol, evaluation metrics, failure cases, and software versions for every experiment.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Keep model claims evidence-based and never remove the research-only disclaimer.
+
+## License
+
+See the repository license file, if present. Check the terms of each dataset, model checkpoint, and dependency separately.
