@@ -4,6 +4,7 @@ Exposes routes for study validation, live segmentation, report generation, and s
 """
 
 import os
+import shutil
 import uuid
 from typing import Optional
 import numpy as np
@@ -13,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from app.config import TEMP_DIR, DISCLAIMER_TEXT
+from app.config import TEMP_DIR, DISCLAIMER_TEXT, MAX_FILE_SIZE_BYTES
 from app.database import init_db, get_db, Study, InferenceRun, Volumetrics, EvaluationMetric, FailureLog
 from app.validator import validate_study_set, ValidationError
 from app.volumetrics import compute_volumes, evaluate_against_expert_mask
@@ -28,11 +29,46 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "NEUROSCOPE_CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
+
+
+async def _save_upload_limited(upload: UploadFile, destination: str) -> None:
+    """Stream an uploaded scan to disk without loading the full file into memory."""
+    total_bytes = 0
+    with open(destination, "wb") as output:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded file exceeds the {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB limit.",
+                )
+            output.write(chunk)
+    if total_bytes == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+
+def _resolve_run_directory(run_id: str):
+    """Accept only canonical UUID run IDs before building filesystem paths."""
+    try:
+        canonical_id = str(uuid.UUID(run_id))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid run ID.") from exc
+    return TEMP_DIR / canonical_id
 
 
 @app.on_event("startup")
@@ -68,17 +104,13 @@ async def validate_study(
     try:
         for key, file_obj in uploads.items():
             save_path = str(run_temp_dir / f"{key}.nii.gz")
-            with open(save_path, "wb") as f:
-                content = await file_obj.read()
-                f.write(content)
+            await _save_upload_limited(file_obj, save_path)
             file_paths[key] = save_path
 
         expert_path = None
         if expert_mask:
             expert_path = str(run_temp_dir / "expert.nii.gz")
-            with open(expert_path, "wb") as f:
-                content = await expert_mask.read()
-                f.write(content)
+            await _save_upload_limited(expert_mask, expert_path)
 
         val_result = validate_study_set(file_paths)
 
@@ -107,16 +139,21 @@ async def validate_study(
         fail_log = FailureLog(error_code=ve.code, message=ve.message)
         db.add(fail_log)
         db.commit()
+        shutil.rmtree(run_temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail={"code": ve.code, "message": ve.message})
+    except HTTPException:
+        shutil.rmtree(run_temp_dir, ignore_errors=True)
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Internal Validation Error: {str(exc)}")
+        shutil.rmtree(run_temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="Unable to validate the uploaded study.") from exc
 
 
 @app.post("/api/v1/segment/{run_id}")
 def run_segmentation(run_id: str, db: Session = Depends(get_db)):
-    run_temp_dir = TEMP_DIR / run_id
-    if not run_temp_dir.exists():
-        raise HTTPException(status_code=404, detail="Run ID directory not found.")
+    run_temp_dir = _resolve_run_directory(run_id)
+    if not run_temp_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Run ID not found.")
 
     file_paths = {
         "t1": str(run_temp_dir / "t1.nii.gz"),
@@ -127,8 +164,15 @@ def run_segmentation(run_id: str, db: Session = Depends(get_db)):
     output_mask_path = str(run_temp_dir / "prediction.nii.gz")
 
     try:
-        pred_label_map, elapsed_time = run_inference(file_paths, output_mask_path)
         study_rec = db.query(Study).filter(Study.study_id == run_id).first()
+        if study_rec is None:
+            raise HTTPException(status_code=404, detail="Validated study record not found.")
+
+        missing_files = [name for name, path in file_paths.items() if not os.path.isfile(path)]
+        if missing_files:
+            raise HTTPException(status_code=400, detail=f"Required modality files are missing: {', '.join(missing_files)}.")
+
+        pred_label_map, elapsed_time = run_inference(file_paths, output_mask_path)
 
         t1_img = nib.load(file_paths["t1"])
         zooms = t1_img.header.get_zooms()[:3]
@@ -193,13 +237,22 @@ def run_segmentation(run_id: str, db: Session = Depends(get_db)):
             "metrics": metrics
         }
 
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Segmentation is unavailable. Configure a validated trained model checkpoint before running inference.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Inference Execution Error: {str(exc)}")
+        raise HTTPException(status_code=500, detail="Inference execution failed.") from exc
 
 
 @app.get("/api/v1/jobs/{run_id}/prediction")
 def download_prediction(run_id: str):
-    output_path = TEMP_DIR / run_id / "prediction.nii.gz"
+    output_path = _resolve_run_directory(run_id) / "prediction.nii.gz"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Prediction file not found.")
     return FileResponse(output_path, filename="prediction.nii.gz", media_type="application/gzip")
@@ -207,7 +260,7 @@ def download_prediction(run_id: str):
 
 @app.get("/api/v1/jobs/{run_id}/report")
 def download_report(run_id: str):
-    pdf_path = TEMP_DIR / run_id / "report.pdf"
+    pdf_path = _resolve_run_directory(run_id) / "report.pdf"
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF Report not found.")
     return FileResponse(pdf_path, filename="NeuroScope_Report.pdf", media_type="application/pdf")
