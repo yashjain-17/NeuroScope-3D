@@ -70,11 +70,8 @@ def load_monai_model():
             blocks_up=[1, 1, 1],
         )
 
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            # Compatibility with older supported PyTorch versions.
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        # Require safe tensor-only deserialization; never fall back to arbitrary pickle loading.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
         state_dict = _checkpoint_state_dict(checkpoint)
         model.load_state_dict(state_dict, strict=True)
@@ -95,9 +92,10 @@ def convert_nested_masks_to_brats_codes(
     if tc_mask.shape != wt_mask.shape or tc_mask.shape != et_mask.shape:
         raise ValueError("TC, WT and ET masks must have identical shapes.")
 
-    # Enforce the expected nesting before assigning mutually exclusive labels.
-    et_mask = np.logical_and(et_mask, tc_mask)
-    tc_mask = np.logical_and(tc_mask, wt_mask)
+    # Enforce WT ⊇ TC ⊇ ET before assigning mutually exclusive labels.
+    wt_mask = np.asarray(wt_mask, dtype=bool)
+    tc_mask = np.logical_and(np.asarray(tc_mask, dtype=bool), wt_mask)
+    et_mask = np.logical_and(np.asarray(et_mask, dtype=bool), tc_mask)
     ed_mask = np.logical_and(wt_mask, np.logical_not(tc_mask))
     ncr_mask = np.logical_and(tc_mask, np.logical_not(et_mask))
 
