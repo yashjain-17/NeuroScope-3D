@@ -114,6 +114,37 @@ async def validate_study(
 
         val_result = validate_study_set(file_paths)
 
+        # An optional expert mask is only meaningful when it matches the validated
+        # study geometry and uses the expected BraTS label set.
+        if expert_path:
+            try:
+                reference_img = nib.load(file_paths["t1"])
+                expert_img = nib.load(expert_path)
+                expert_data = expert_img.get_fdata(dtype=np.float32)
+            except Exception as exc:
+                raise ValidationError(
+                    code="INVALID_EXPERT_MASK",
+                    message="The optional expert mask is not a readable NIfTI volume.",
+                ) from exc
+
+            if expert_data.ndim != 3 or expert_data.shape != reference_img.shape:
+                raise ValidationError(
+                    code="EXPERT_MASK_SHAPE_MISMATCH",
+                    message="Expert mask dimensions must match the validated T1 volume.",
+                )
+            if not np.allclose(expert_img.affine, reference_img.affine, atol=1e-3):
+                raise ValidationError(
+                    code="EXPERT_MASK_AFFINE_MISMATCH",
+                    message="Expert mask coordinates must match the validated T1 volume.",
+                )
+            if not np.isfinite(expert_data).all() or not np.isin(
+                expert_data, [0, 1, 2, 4]
+            ).all():
+                raise ValidationError(
+                    code="INVALID_EXPERT_MASK_LABELS",
+                    message="Expert mask must contain only BraTS labels 0, 1, 2, and 4.",
+                )
+
         study_rec = Study(
             study_id=run_id,
             t1_filename=t1.filename,
