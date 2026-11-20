@@ -47,7 +47,8 @@ def test_validate_single_nifti_valid(temp_nifti_dir):
 
 def test_brain_plausibility_check_is_opt_in(temp_nifti_dir):
     p = temp_nifti_dir / "cropped_field_of_view.nii.gz"
-    make_dummy_nifti(p, shape=(16, 16, 16), fill=1.0)
+    data = np.random.RandomState(7).randn(16, 16, 16).astype(np.float32)
+    nib.save(nib.Nifti1Image(data, np.eye(4)), str(p))
 
     # Small/cropped research volumes should pass structural validation by default.
     nii, data, affine, zooms = validate_single_nifti(str(p))
