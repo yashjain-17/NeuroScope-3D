@@ -45,6 +45,21 @@ def test_validate_single_nifti_valid(temp_nifti_dir):
     assert zooms == (1.0, 1.0, 1.5)
 
 
+def test_brain_plausibility_check_is_opt_in(temp_nifti_dir):
+    p = temp_nifti_dir / "cropped_field_of_view.nii.gz"
+    make_dummy_nifti(p, shape=(16, 16, 16), fill=1.0)
+
+    # Small/cropped research volumes should pass structural validation by default.
+    nii, data, affine, zooms = validate_single_nifti(str(p))
+    assert nii.shape == (16, 16, 16)
+    assert data.shape == (16, 16, 16)
+
+    # Callers may still explicitly request the coarse whole-brain heuristic.
+    with pytest.raises(ValidationError) as exc:
+        validate_single_nifti(str(p), enforce_brain_plausibility=True)
+    assert exc.value.code == "NOT_A_BRAIN"
+
+
 def test_validate_single_nifti_constant_rejected(temp_nifti_dir):
     p = temp_nifti_dir / "constant.nii.gz"
     make_dummy_nifti(p, fill=0.0)
