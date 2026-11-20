@@ -55,7 +55,12 @@ def _check_brain_plausibility(data: np.ndarray, zooms: Tuple[float, ...]) -> Non
             raise ValidationError("NOT_A_BRAIN", "Volume intensity distribution is near-uniform noise/constant data.")
 
 
-def validate_single_nifti(file_path: str, enforce_brain_plausibility: bool = True) -> Tuple[nib.Nifti1Image, np.ndarray, np.ndarray, Tuple[float, ...]]:
+def validate_single_nifti(file_path: str, enforce_brain_plausibility: bool = False) -> Tuple[nib.Nifti1Image, np.ndarray, np.ndarray, Tuple[float, ...]]:
+    """Validate NIfTI structure and geometry; brain-size heuristics are opt-in.
+
+    Cropped fields of view and partial-volume research scans are valid inputs,
+    so the coarse whole-brain plausibility heuristic must not reject them by default.
+    """
     check_file_size(file_path)
     _check_gzip_integrity(file_path)
     try:
